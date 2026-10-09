@@ -1,0 +1,90 @@
+name: CI
+
+# What this CI can and cannot show.
+#
+# A hosted runner does NOT reproduce the replay ceiling or any number in the
+# README: its CPUs and disks are shared and virtualized, and the load here is
+# tiny on purpose. This is a functional smoke of the HARNESS: the script is
+# lint-clean, and on a small load it stands up a primary and a streaming
+# standby, loads, pauses and resumes replay, measures, and writes lag.csv and
+# lag.svg. Real numbers need real hardware.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: bash -n replay_ceiling.sh
+      - name: shellcheck
+        run: shellcheck replay_ceiling.sh
+      - name: python syntax
+        run: python3 -m py_compile plot_lag.py
+
+  smoke:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18]
+    env:
+      WORKDIR: ${{ github.workspace }}/replay-ceiling-work
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }} from PGDG
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-${{ matrix.pg }}
+          if [ ! -x /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config ]; then
+            sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }}
+          fi
+
+      - name: Functional smoke (tiny load; the numbers mean nothing here)
+        env:
+          PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          ROWS: 500000
+          ROUNDS: 1
+          COOLDOWN: 2
+          SHARED_BUFFERS: 256MB
+          KEEP: 1
+        run: ./replay_ceiling.sh | tee smoke-output.txt
+
+      - name: Check that every stage produced output
+        run: |
+          # one round x two modes (1 session and K sessions), five numeric fields,
+          # and a replay rate above zero: a stage that failed silently shows up here
+          test "$(wc -l < "$WORKDIR/results.txt")" -eq 2
+          awk 'NF != 5 || $4 + 0 <= 0 { bad = 1 } END { exit bad }' "$WORKDIR/results.txt"
+          grep -q 'replay ceiling (paused replay, local WAL)' smoke-output.txt
+          grep -q 'Streaming round' smoke-output.txt
+          test "$(wc -l < "$WORKDIR/lag.csv")" -gt 1
+          test -s "$WORKDIR/lag.svg"
+
+      - name: Keep the smoke output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-pg${{ matrix.pg }}
+          path: |
+            smoke-output.txt
+            replay-ceiling-work/results.txt
+            replay-ceiling-work/lag.csv
+            replay-ceiling-work/lag.svg
+            replay-ceiling-work/*.log
+          if-no-files-found: warn
